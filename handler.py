@@ -1,142 +1,155 @@
 """
-Aura Chat Image Generation Worker for RunPod Serverless
-FLUX Dev + Uncensored LoRA + Character LoRA
+Aura Chat Image Generation Worker
+Supports both RunPod Serverless and Vast.ai Serverless (HTTP server mode)
+
+Usage:
+  - RunPod:  Automatically detected, uses runpod.serverless.start()
+  - Vast.ai: Starts FastAPI HTTP server on port 3000
+  - Direct:  WORKER_MODE=http python handler.py
 """
 import os
 import io
 import base64
 import time
 import torch
-import runpod
-from pathlib import Path
+import logging
 
-# Global pipeline - loaded once, reused across requests
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("aura-worker")
+
+# ============================================================
+# Global state
+# ============================================================
 pipe = None
 loaded_character_lora = None
 
-MODELS_DIR = "/models"
-LORAS_DIR = f"{MODELS_DIR}/loras"
+MODELS_DIR = os.environ.get("HF_HOME", "/workspace/models")
+LORAS_DIR = "/workspace/loras"
 
-# LoRA URLs - hosted on HuggingFace (public)
-UNCENSORED_LORA_URL = os.environ.get(
-    "UNCENSORED_LORA_URL",
-    "https://huggingface.co/enhanceaiteam/Flux-Uncensored-V2/resolve/main/lora.safetensors"
-)
+UNCENSORED_LORA_HF = "enhanceaiteam/Flux-Uncensored-V2"
 
-# Character LoRA URLs - map character name to URL
+# Character LoRA URLs - hosted on Cloudflare R2 or local
 CHARACTER_LORAS = {
-    "luna": os.environ.get("LUNA_LORA_URL", "https://pub-4feac03f1ed6434e92e77e654d66ef68.r2.dev/models/loras/luna-character.safetensors"),
-    # Add more characters as they are trained
+    "luna": os.environ.get("LUNA_LORA_URL", ""),
+    # Add more characters as trained
 }
 
+# ============================================================
+# Model loading
+# ============================================================
+
 def download_file(url: str, dest: str):
-    """Download a file if it doesn't already exist."""
     if os.path.exists(dest):
-        print(f"  [cached] {dest}")
+        logger.info(f"  [cached] {dest}")
         return
-    print(f"  [downloading] {url} -> {dest}")
+    logger.info(f"  [downloading] {url} -> {dest}")
     import urllib.request
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     urllib.request.urlretrieve(url, dest)
-    print(f"  [done] {os.path.getsize(dest) / 1024 / 1024:.0f}MB")
+    logger.info(f"  [done] {os.path.getsize(dest) / 1024 / 1024:.0f}MB")
+
 
 def load_pipeline():
-    """Load FLUX Dev pipeline + Uncensored LoRA. Only runs on first request."""
     global pipe
     if pipe is not None:
         return
 
-    print("=== Loading FLUX Dev pipeline ===")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    logger.info("=== Loading FLUX Dev pipeline ===")
     start = time.time()
 
     from diffusers import FluxPipeline
 
-    # Download uncensored LoRA
-    uncensored_path = f"{LORAS_DIR}/flux-uncensored-v2.safetensors"
-    download_file(UNCENSORED_LORA_URL, uncensored_path)
-
-    # Load FLUX Dev FP8 (auto-downloads from HuggingFace, ~17GB first time)
-    print("  Loading FLUX Dev model...")
     pipe = FluxPipeline.from_pretrained(
         "black-forest-labs/FLUX.1-dev",
         torch_dtype=torch.bfloat16,
     )
-    pipe.to("cuda")
+    # Sequential offload for 24GB GPUs; switch to enable_model_cpu_offload for 48GB+
+    vram_gb = torch.cuda.get_device_properties(0).total_mem / 1e9 if torch.cuda.is_available() else 0
+    if vram_gb >= 40:
+        pipe.enable_model_cpu_offload()
+        logger.info(f"  Using model_cpu_offload (VRAM: {vram_gb:.0f}GB)")
+    else:
+        pipe.enable_sequential_cpu_offload()
+        pipe.vae.enable_slicing()
+        pipe.vae.enable_tiling()
+        logger.info(f"  Using sequential_cpu_offload + VAE tiling (VRAM: {vram_gb:.0f}GB)")
 
-    # Enable memory optimizations
-    pipe.enable_model_cpu_offload()
-
-    # Load uncensored LoRA as base
-    print("  Loading Uncensored LoRA...")
-    pipe.load_lora_weights(
-        uncensored_path,
-        adapter_name="uncensored"
-    )
+    # Load uncensored LoRA
+    logger.info("  Loading Uncensored LoRA...")
+    pipe.load_lora_weights(UNCENSORED_LORA_HF, adapter_name="uncensored")
 
     elapsed = time.time() - start
-    print(f"=== Pipeline ready in {elapsed:.0f}s ===")
+    logger.info(f"=== Pipeline ready in {elapsed:.0f}s ===")
+
 
 def load_character_lora(character: str):
-    """Load a character-specific LoRA on top of the uncensored base."""
     global pipe, loaded_character_lora
 
     if loaded_character_lora == character:
-        return  # Already loaded
+        return
 
+    # Check local file first, then URL
+    local_path = f"{LORAS_DIR}/{character}-character.safetensors"
     lora_url = CHARACTER_LORAS.get(character, "")
-    if not lora_url:
-        # No character LoRA, just use uncensored
+
+    if os.path.exists(local_path):
+        logger.info(f"  Loading {character} LoRA from local: {local_path}")
+        pipe.load_lora_weights(local_path, adapter_name=character)
+    elif lora_url:
+        dest = f"{LORAS_DIR}/{character}-character.safetensors"
+        download_file(lora_url, dest)
+        pipe.load_lora_weights(dest, adapter_name=character)
+    else:
+        # No character LoRA available, use uncensored only
         pipe.set_adapters(["uncensored"], adapter_weights=[0.8])
         loaded_character_lora = None
         return
 
-    char_path = f"{LORAS_DIR}/{character}-character.safetensors"
-    download_file(lora_url, char_path)
-
-    print(f"  Loading {character} character LoRA...")
-    pipe.load_lora_weights(
-        char_path,
-        adapter_name=character
-    )
-
-    # Stack both LoRAs: uncensored (for NSFW capability) + character (for consistency)
     pipe.set_adapters(
         ["uncensored", character],
-        adapter_weights=[0.6, 0.8]  # Character LoRA stronger than uncensored
+        adapter_weights=[0.6, 0.8]
     )
     loaded_character_lora = character
 
-def handler(job):
-    """RunPod handler function - processes image generation requests."""
-    job_input = job["input"]
 
-    # Extract parameters
-    prompt = job_input.get("prompt", "")
-    character = job_input.get("character", None)  # Optional character name
-    width = job_input.get("width", 1024)
-    height = job_input.get("height", 1024)
-    steps = job_input.get("num_inference_steps", 28)
-    guidance = job_input.get("guidance_scale", 3.5)
-    seed = job_input.get("seed", None)
+# ============================================================
+# Generation core
+# ============================================================
+
+def generate_image(params: dict) -> dict:
+    """Core generation function shared by all server modes."""
+    prompt = params.get("prompt", "")
+    character = params.get("character", None)
+    width = params.get("width", 768)
+    height = params.get("height", 768)
+    steps = params.get("num_inference_steps", 25)
+    guidance = params.get("guidance_scale", 3.5)
+    seed = params.get("seed", None)
+    uncensored_weight = params.get("uncensored_weight", 0.6)
+    character_weight = params.get("character_weight", 0.8)
 
     if not prompt:
         return {"error": "prompt is required"}
 
-    # Load pipeline (cached after first call)
     load_pipeline()
 
-    # Load character LoRA if specified
     if character:
         load_character_lora(character)
+        # Allow dynamic weight adjustment per request
+        adapters = ["uncensored", character] if loaded_character_lora == character else ["uncensored"]
+        weights = [uncensored_weight, character_weight] if len(adapters) == 2 else [uncensored_weight]
+        pipe.set_adapters(adapters, adapter_weights=weights)
     else:
-        pipe.set_adapters(["uncensored"], adapter_weights=[0.8])
+        pipe.set_adapters(["uncensored"], adapter_weights=[uncensored_weight])
 
-    # Generate
     generator = None
     if seed is not None:
-        generator = torch.Generator(device="cuda").manual_seed(seed)
+        generator = torch.Generator(device="cpu").manual_seed(seed)
 
-    print(f"Generating: {prompt[:80]}... ({width}x{height}, {steps} steps)")
+    logger.info(f"Generating: {prompt[:80]}... ({width}x{height}, {steps} steps)")
+    torch.cuda.empty_cache()
     start = time.time()
 
     image = pipe(
@@ -149,9 +162,8 @@ def handler(job):
     ).images[0]
 
     elapsed = time.time() - start
-    print(f"Generated in {elapsed:.1f}s")
+    logger.info(f"Generated in {elapsed:.1f}s")
 
-    # Convert to base64
     buffer = io.BytesIO()
     image.save(buffer, format="WEBP", quality=90)
     img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
@@ -164,5 +176,77 @@ def handler(job):
         "generation_time_seconds": round(elapsed, 2),
     }
 
-# Start the RunPod serverless worker
-runpod.serverless.start({"handler": handler})
+
+# ============================================================
+# Server modes
+# ============================================================
+
+def start_http_server():
+    """Vast.ai / generic HTTP mode — FastAPI server on port 3000."""
+    from fastapi import FastAPI
+    from pydantic import BaseModel
+    from typing import Optional
+    import uvicorn
+
+    app = FastAPI(title="Aura Image Gen")
+
+    class GenRequest(BaseModel):
+        prompt: str
+        character: Optional[str] = None
+        width: int = 768
+        height: int = 768
+        num_inference_steps: int = 25
+        guidance_scale: float = 3.5
+        seed: Optional[int] = None
+        uncensored_weight: float = 0.6
+        character_weight: float = 0.8
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok", "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none"}
+
+    @app.post("/generate")
+    def generate(req: GenRequest):
+        return generate_image(req.model_dump())
+
+    # Vast.ai pyworker compatibility
+    @app.post("/generate/sync")
+    def generate_sync(req: GenRequest):
+        return generate_image(req.model_dump())
+
+    port = int(os.environ.get("PORT", "3000"))
+    logger.info(f"Starting HTTP server on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+def start_runpod():
+    """RunPod Serverless mode."""
+    import runpod
+
+    def handler(job):
+        return generate_image(job["input"])
+
+    runpod.serverless.start({"handler": handler})
+
+
+# ============================================================
+# Entry point
+# ============================================================
+
+if __name__ == "__main__":
+    mode = os.environ.get("WORKER_MODE", "auto")
+
+    if mode == "http":
+        start_http_server()
+    elif mode == "runpod":
+        start_runpod()
+    else:
+        # Auto-detect: if runpod package is available and we're in RunPod env, use it
+        try:
+            import runpod
+            if os.environ.get("RUNPOD_POD_ID"):
+                start_runpod()
+            else:
+                start_http_server()
+        except ImportError:
+            start_http_server()
