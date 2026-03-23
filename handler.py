@@ -25,7 +25,7 @@ UNCENSORED_LORA_URL = os.environ.get(
 
 # Character LoRA URLs - map character name to URL
 CHARACTER_LORAS = {
-    "luna": os.environ.get("LUNA_LORA_URL", ""),
+    "luna": os.environ.get("LUNA_LORA_URL", "https://pub-4feac03f1ed6434e92e77e654d66ef68.r2.dev/models/loras/luna-character.safetensors"),
     # Add more characters as they are trained
 }
 
