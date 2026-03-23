@@ -66,7 +66,7 @@ def load_pipeline():
         torch_dtype=torch.bfloat16,
     )
     # Sequential offload for 24GB GPUs; switch to enable_model_cpu_offload for 48GB+
-    vram_gb = torch.cuda.get_device_properties(0).total_mem / 1e9 if torch.cuda.is_available() else 0
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3) if torch.cuda.is_available() else 0
     if vram_gb >= 40:
         pipe.enable_model_cpu_offload()
         logger.info(f"  Using model_cpu_offload (VRAM: {vram_gb:.0f}GB)")
